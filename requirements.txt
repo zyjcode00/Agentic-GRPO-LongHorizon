@@ -1,0 +1,7 @@
+verl
+vllm
+torch>=2.4
+flash-attn
+tau-bench
+omegaconf
+ray
