@@ -1,5 +1,10 @@
 """veRL/Ray-style GRPO training utilities.
 
+中文导读：本文件是项目中“训练器 / rollout 样本缓冲区 / advantage 计算”的核心实现。
+它负责把 vLLM 生成的回答转换成 GRPO 可训练样本，并提供奖励打分、分组优势归一化、
+梯度累积、训练诊断和 CUDA cache 清理等训练入口脚本需要调用的能力。
+
+
 This module intentionally keeps the core training loop lightweight and easy to
 unit test while exposing the integration points needed by an industrial GRPO
 pipeline:
@@ -30,7 +35,12 @@ from src.algorithms.reward_model import GRPORewardModel, RewardBreakdown, ToolSp
 
 @dataclass(frozen=True)
 class GRPOSample:
-    """One rollout sample used for GRPO policy optimisation."""
+    """One rollout sample used for GRPO policy optimisation.
+
+    中文说明：一个 GRPO 样本对应一次 rollout 的训练记录，包含原始 prompt、模型 response、
+    生成时的 logprobs、基于 reward 归一化得到的 advantage，以及可选的 group/reward/metadata。
+    后续 loss_fn 会读取这些字段来计算策略更新目标。
+    """
 
     prompt: str
     response: str
@@ -51,6 +61,7 @@ class DistributedGRPOBuffer:
     """
 
     def __init__(self) -> None:
+        # 内部使用普通 list 保存样本；真实分布式训练时可把该类包装成 Ray Actor。
         self._samples: list[GRPOSample] = []
 
     def add(
@@ -64,6 +75,7 @@ class DistributedGRPOBuffer:
         reward: float | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> GRPOSample:
+        # 将输入字段规范化为 GRPOSample，确保 advantage/reward 为 float，metadata 为普通 dict。
         sample = GRPOSample(
             prompt=prompt,
             response=response,
@@ -100,7 +112,11 @@ class DistributedGRPOBuffer:
 
 
 class GRPOWorker:
-    """Rollout worker that scores vLLM generations with ``GRPORewardModel``."""
+    """Rollout worker that scores vLLM generations with ``GRPORewardModel``.
+
+    中文说明：Worker 的职责很单一：接收 rollout 阶段生成的 response，调用奖励模型返回
+    RewardBreakdown。这样可以让“生成”“奖励”“训练”三个部分解耦。
+    """
 
     def __init__(
         self,
@@ -109,6 +125,7 @@ class GRPOWorker:
         reward_config: Mapping[str, Any] | None = None,
         config_path: str | Path | None = None,
     ) -> None:
+        # 避免同时传入已构造好的 reward_model 和构造 reward_model 所需配置，防止配置来源冲突。
         if reward_model is not None and (reward_config is not None or config_path is not None):
             raise ValueError("Pass either reward_model or reward_config/config_path, not both")
         self.reward_model = reward_model or build_reward_model_from_config(
@@ -165,6 +182,10 @@ def compute_advantages_distributed(
 ) -> list[float]:
     """Compute globally normalised advantages across Ray workers.
 
+    中文说明：GRPO 通常会对同一 prompt 的多条候选回答做 group-wise 标准化。
+    分布式场景下，每个 worker 只看到本地 reward，因此这里先尝试收集全局 reward，
+    用全局统计量计算 advantage，再切回当前 worker 对应的本地结果。
+
     ``local_rewards`` contains the rewards visible to the current worker. In a
     real Ray run, pass ``gather_fn`` that returns all worker payloads, or rely on a
     Ray actor/collective wrapper to provide ``ray.get``-compatible object refs.
@@ -178,6 +199,7 @@ def compute_advantages_distributed(
     if len(local_group_ids) != len(local_values):
         raise ValueError("group_ids must have the same length as local_rewards")
 
+    # payload 是当前 worker 与其他 worker 交换的最小信息：reward 数值和分组 id。
     payload = {"rewards": local_values, "group_ids": local_group_ids}
     gathered = gather_fn(payload) if gather_fn is not None else _try_ray_gather(payload, ray_module=ray_module)
     payloads = _normalise_gathered_payloads(gathered, fallback=payload)
@@ -195,13 +217,22 @@ def compute_advantages_distributed(
         all_rewards.extend(rewards)
         all_group_ids.extend(gids)
 
+    # 先基于全局 reward 计算 advantage，再根据本地 payload 在 all-gather 结果中的 offset 截取回来。
     all_advantages = reward_model.compute_group_advantages(all_rewards, group_ids=all_group_ids)
     offset = sum(len(payloads[i]["rewards"]) for i in range(local_payload_index))
     return all_advantages[offset : offset + len(local_values)]
 
 
 class GRPOTrainer:
-    """Minimal veRL-style trainer with diagnostics and gradient accumulation."""
+    """Minimal veRL-style trainer with diagnostics and gradient accumulation.
+
+    中文说明：这是训练主控类：
+    1. 调用 worker/reward_model 给 rollout 打分；
+    2. 计算 group-normalized advantage；
+    3. 将样本写入 buffer；
+    4. 调用外部注入的 loss_fn 与 optimizer 执行训练更新。
+    代码保持框架无关，方便接入 torch、veRL 或单元测试中的 mock 对象。
+    """
 
     def __init__(
         self,
@@ -214,6 +245,7 @@ class GRPOTrainer:
         loss_fn: Callable[[Any, Sequence[GRPOSample]], Any] | None = None,
         empty_cache_every: int | None = None,
     ) -> None:
+        # 读取默认 YAML 配置，并叠加外部 overrides。
         self.config = load_grpo_config(config_path=config_path, overrides=config)
         self.reward_model = reward_model or build_reward_model_from_config(reward_config=self.config.get("reward_model", {}))
         self.worker = GRPOWorker(self.reward_model)
@@ -222,6 +254,7 @@ class GRPOTrainer:
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         train_cfg = self.config.get("trainer", {})
+        # 梯度累积步数：显存不足时可用多个 micro-batch 模拟更大的有效 batch。
         self.gradient_accumulation_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
         self.empty_cache_every = empty_cache_every if empty_cache_every is not None else train_cfg.get("empty_cache_every", 1)
         self.global_step = 0
@@ -244,12 +277,14 @@ class GRPOTrainer:
         if not (len(prompts) == len(responses) == len(logprobs)):
             raise ValueError("prompts, responses and logprobs must have the same length")
         group_ids = list(group_ids) if group_ids is not None else list(prompts)
+        # 1) 对 rollout response 逐条打分，得到可解释的 RewardBreakdown。
         rewards = self.worker.score_batch(
             prompts,
             responses,
             contexts=contexts,
             outcome_rewards=outcome_rewards,
         )
+        # 2) 对 reward 做 group-wise 标准化，得到 GRPO 训练使用的 advantage。
         advantages = compute_advantages_distributed(
             rewards,
             group_ids=group_ids,
@@ -257,6 +292,7 @@ class GRPOTrainer:
             gather_fn=gather_fn,
         )
         samples: list[GRPOSample] = []
+        # 3) 将 prompt/response/logprob/advantage/reward 明细写入训练 buffer。
         for prompt, response, lp, gid, breakdown, advantage in zip(prompts, responses, logprobs, group_ids, rewards, advantages):
             samples.append(
                 self.buffer.add(
@@ -286,12 +322,14 @@ class GRPOTrainer:
             return {"loss": 0.0, "optimizer_steps": float(self.optimizer_steps)}
         if self.loss_fn is None:
             # CI-friendly default: a deterministic surrogate objective.
+            # 中文说明：测试环境可能没有真实 policy/optimizer，这里用确定性的替代 loss 保证流程可跑通。
             avg_loss = -sum(sample.advantage for sample in batch) / len(batch)
             self.global_step += 1
             self._maybe_empty_cache()
             return {"loss": float(avg_loss), "optimizer_steps": float(self.optimizer_steps)}
 
         total_loss = 0.0
+        # 将 batch 切成多个 micro-batch，逐个 backward，并按累积步数触发 optimizer.step()。
         micro_batches = [batch[i : i + self.gradient_accumulation_steps] for i in range(0, len(batch), self.gradient_accumulation_steps)]
         if self.optimizer is not None and hasattr(self.optimizer, "zero_grad"):
             self.optimizer.zero_grad()
@@ -316,6 +354,7 @@ class GRPOTrainer:
     def log_iteration_diagnostics(self, rewards: Sequence[RewardBreakdown]) -> dict[str, float]:
         """Print reward saturation diagnostics for the current batch."""
 
+        # 记录 reward 方差、平均长度、平均 reward，用于观察奖励饱和或输出过长等训练现象。
         final_rewards = [float(r.final_reward) for r in rewards]
         lengths = [float(r.length) for r in rewards]
         mean_reward = sum(final_rewards) / len(final_rewards) if final_rewards else 0.0

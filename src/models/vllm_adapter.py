@@ -1,5 +1,10 @@
 """Async vLLM rollout adapter with ContextVar-isolated tau-bench state.
 
+中文导读：本文件封装 vLLM 的异步生成能力，用于 GRPO 的 rollout 阶段。
+它支持真实 vLLM 引擎，也支持测试时注入 fake engine；同时用 ContextVar 隔离每个
+异步请求的 tau-bench 环境会话与工具上下文，避免并发生成时状态串线。
+
+
 The module is intentionally importable without vLLM installed.  Production code
 can construct :class:`AsyncVLLMRollout` with ``model=...``/``engine_args=...`` to
 create a real ``vllm.AsyncLLMEngine`` lazily, while tests and CPU-only CI can
@@ -18,13 +23,20 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Mapping, MutableMapping, Sequence
 
 
+# ContextVar 是“协程局部变量”：同一线程内不同 asyncio task 可以拥有不同值。
+# 这里保存当前 rollout 请求对应的环境会话 id。
 _env_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("vllm_env_session_id", default=None)
+# 保存当前请求的工具上下文，例如用户信息、环境状态、可用工具等。
 _tool_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("vllm_tool_context", default={})
 
 
 @dataclass(frozen=True)
 class RolloutContext:
-    """Per-coroutine rollout context for tau-bench/tool execution."""
+    """Per-coroutine rollout context for tau-bench/tool execution.
+
+    中文说明：封装单条 rollout 请求的环境会话 id 和工具上下文，
+    可写入 generation metadata，便于后续 reward/trainer 追踪。
+    """
 
     env_session_id: str
     tool_context: Mapping[str, Any] = field(default_factory=dict)
@@ -38,7 +50,11 @@ class RolloutContext:
 
 @dataclass(frozen=True)
 class VLLMGeneration:
-    """Normalised output from one vLLM request."""
+    """Normalised output from one vLLM request.
+
+    中文说明：不同 vLLM/fake engine 返回格式可能不同，本类把它们统一成
+    prompt、response、logprobs、token_ids、context 等训练器能直接消费的字段。
+    """
 
     prompt: str
     response: str
@@ -52,6 +68,7 @@ class VLLMGeneration:
 
     @property
     def num_tokens(self) -> int:
+        # 优先使用引擎返回的 token_ids 计数；没有时退化为按空格粗略估算。
         if self.token_ids:
             return len(self.token_ids)
         return len(self.response.split())
@@ -76,7 +93,11 @@ class VLLMGeneration:
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    """Batch payload that can be passed directly to ``GRPOTrainer.ingest_rollouts``."""
+    """Batch payload that can be passed directly to ``GRPOTrainer.ingest_rollouts``.
+
+    中文说明：一次批量 rollout 的聚合结果，既包含原始 generations，
+    也包含 trainer.ingest_rollouts 需要的 prompts/responses/logprobs/group_ids。
+    """
 
     prompts: list[str]
     responses: list[str]
@@ -107,6 +128,7 @@ def get_current_tool_context() -> dict[str, Any]:
 def rollout_context(env_session_id: str, tool_context: Mapping[str, Any] | None = None):
     """Temporarily bind rollout ContextVars in the current context."""
 
+    # set() 返回 token，finally 中用 token reset，确保临时上下文不会泄漏到其他请求。
     env_token = _env_session_id.set(env_session_id)
     tool_token = _tool_context.set(dict(tool_context or {}))
     try:
@@ -118,6 +140,9 @@ def rollout_context(env_session_id: str, tool_context: Mapping[str, Any] | None 
 
 class AsyncVLLMRollout:
     """Async parallel sampler around ``vllm.AsyncLLMEngine``.
+
+    中文说明：该类负责把一组 prompts 并发发送给 vLLM，引擎完成后立即返回/流式产出结果；
+    同时统计 tokens、耗时、TPS 等 rollout 指标。
 
     Parameters
     ----------
@@ -144,6 +169,7 @@ class AsyncVLLMRollout:
         request_id_prefix: str = "grpo-rollout",
         print_tps: bool = True,
     ) -> None:
+        # 如果外部传入 fake/真实 engine 就直接使用；否则根据 model/engine_args 懒构造 vLLM 引擎。
         self.engine = engine if engine is not None else self._build_engine(model=model, engine_args=engine_args)
         self.sampling_params = self._build_sampling_params(sampling_params)
         self.max_concurrency = max_concurrency
@@ -162,6 +188,7 @@ class AsyncVLLMRollout:
     ) -> list[VLLMGeneration]:
         """Generate responses for a batch of prompts concurrently."""
 
+        # generate_iter 按完成顺序 yield；这里用 index 排序恢复输入 prompt 的原始顺序。
         indexed: list[tuple[int, VLLMGeneration]] = []
         async for index, generation in self.generate_iter(
             prompts,
@@ -171,6 +198,7 @@ class AsyncVLLMRollout:
             env_session_ids=env_session_ids,
         ):
             indexed.append((index, generation))
+        # 按原始 prompt 下标排序，确保 prompts/responses/logprobs/group_ids 一一对齐。
         indexed.sort(key=lambda item: item[0])
         return [generation for _, generation in indexed]
 
@@ -186,6 +214,7 @@ class AsyncVLLMRollout:
         """Yield generations as soon as individual requests finish."""
 
         prompts = list(prompts)
+        # 将可选 contexts/env_session_ids 规范成与 prompts 等长的 list，便于按 index 访问。
         contexts = _normalise_optional_sequence(contexts, len(prompts), default=None, name="contexts")
         group_ids = list(group_ids) if group_ids is not None else list(prompts)
         env_session_ids = _normalise_optional_sequence(env_session_ids, len(prompts), default=None, name="env_session_ids")
@@ -193,6 +222,7 @@ class AsyncVLLMRollout:
             raise ValueError("group_ids must have the same length as prompts")
 
         params = self._build_sampling_params(sampling_params) if sampling_params is not None else self.sampling_params
+        # max_concurrency 用信号量限制同时在飞的 vLLM 请求数，避免压垮显存或服务。
         semaphore = asyncio.Semaphore(self.max_concurrency) if self.max_concurrency else None
         started = time.perf_counter()
         total_tokens = 0
@@ -215,6 +245,7 @@ class AsyncVLLMRollout:
                     env_session_id=env_session_ids[index] or f"tau-{index}-{uuid.uuid4().hex[:8]}",
                 )
 
+        # 每个 prompt 创建一个 asyncio task；as_completed 可在单个请求完成时尽早处理。
         tasks = [asyncio.create_task(run_one(i)) for i in range(len(prompts))]
         try:
             for task in asyncio.as_completed(tasks):
@@ -229,6 +260,7 @@ class AsyncVLLMRollout:
                 }
                 yield index, generation
         finally:
+            # 如果迭代中途异常或调用方提前退出，取消未完成任务，避免后台协程泄漏。
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -256,10 +288,12 @@ class AsyncVLLMRollout:
         group_id: Any,
         env_session_id: str,
     ) -> VLLMGeneration:
+        # request_id 用于追踪 vLLM 请求；env_session_id 用于追踪 tau-bench 环境会话。
         request_id = f"{self.request_id_prefix}-{uuid.uuid4().hex}"
         context_dict = dict(context or {})
         tool_context = dict(context_dict.get("tool_context") or context_dict)
         started = time.perf_counter()
+        # 在生成期间绑定当前请求的工具上下文，工具调用代码可通过 get_current_* 读取。
         with rollout_context(env_session_id, tool_context):
             raw_output = await self._call_engine_generate(prompt, sampling_params, request_id)
             response, logprobs, token_ids = _extract_generation(raw_output)
@@ -282,6 +316,7 @@ class AsyncVLLMRollout:
 
     async def _call_engine_generate(self, prompt: str, sampling_params: Any, request_id: str) -> Any:
         generated = self.engine.generate(prompt, sampling_params, request_id)
+        # vLLM 可能返回 async iterator（流式输出），也可能返回 coroutine/普通对象，这里统一兼容。
         if hasattr(generated, "__aiter__"):
             last = None
             async for output in generated:
@@ -343,6 +378,11 @@ async def generate_and_score(
 ) -> RolloutBatch:
     """Sample with vLLM, stream-completed outputs to a scorer, then ingest.
 
+    中文说明：这是 rollout 与训练器之间的桥接函数：
+    1. 调用 AsyncVLLMRollout 并发生成；
+    2. 如果有 worker，生成完成后立即打 reward；
+    3. 如果有 trainer，最终把对齐后的 batch 写入 trainer buffer。
+
     If ``worker`` is supplied, each completed response is immediately scored via
     ``worker.score_response`` to mimic online rollout-worker reward streaming.
     If ``trainer`` is supplied, the final aligned batch is passed to
@@ -350,6 +390,7 @@ async def generate_and_score(
     result.
     """
 
+    # 优先使用显式传入的 worker；否则复用 trainer.worker。
     scorer = worker or getattr(trainer, "worker", None)
     rewards_by_index: dict[int, Any] = {}
     indexed: list[tuple[int, VLLMGeneration]] = []
@@ -363,6 +404,7 @@ async def generate_and_score(
         env_session_ids=env_session_ids,
     ):
         indexed.append((index, generation))
+        # 每条 generation 完成后即可在线打分，不必等待整个 batch 全部结束。
         if scorer is not None and hasattr(scorer, "score_response"):
             rewards_by_index[index] = scorer.score_response(
                 generation.prompt,

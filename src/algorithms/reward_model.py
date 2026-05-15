@@ -1,5 +1,11 @@
 """Reward utilities for GRPO training.
 
+中文导读：本文件实现项目的轻量奖励模型。它不是大型神经网络 Reward Model，
+而是一套可解释的启发式评分逻辑：解析模型输出中的 thought/action/observation/final，
+奖励有效工具调用和有证据支撑的推理，惩罚错误工具调用、重复步骤和无依据推理；
+随后用 LATA 做长度归一化，并为 GRPO 计算 group advantage。
+
+
 This module implements three pieces used by the project training loop:
 
 * PRM-Lite: a lightweight process reward model that scores intermediate
@@ -28,6 +34,9 @@ ToolValidator = Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
 class ToolSpec:
     """Validation rules for a callable tool/API.
 
+    中文说明：ToolSpec 描述一个工具/API 调用是否合法，例如必须有哪些参数、
+    允许哪些可选参数，以及某些参数值是否通过自定义校验函数。
+
     Attributes:
         required_params: Parameters that must be present in a tool call.
         optional_params: Parameters that are allowed but not required. If both
@@ -48,7 +57,11 @@ class ToolSpec:
 
 @dataclass(frozen=True)
 class ThoughtStep:
-    """One parsed step from a model thought chain."""
+    """One parsed step from a model thought chain.
+
+    中文说明：模型输出会被切分成多个步骤，每个步骤被归类为 thought、tool_call、
+    observation 或 final，方便逐步给过程奖励。
+    """
 
     index: int
     kind: str
@@ -69,7 +82,11 @@ class StepReward:
 
 @dataclass(frozen=True)
 class RewardBreakdown:
-    """Detailed reward result for a single sampled response."""
+    """Detailed reward result for a single sampled response.
+
+    中文说明：保存一次 response 的完整奖励明细，包括原始过程奖励、长度归一化后的
+    最终奖励、每一步的奖励归因，以及外部环境给出的终局奖励。
+    """
 
     raw_reward: float
     final_reward: float
@@ -80,6 +97,11 @@ class RewardBreakdown:
 
 class GRPORewardModel:
     """Lightweight GRPO reward model with PRM-Lite, LATA and group advantage.
+
+    中文说明：
+    - PRM-Lite：按步骤打分，鼓励正确工具调用和基于证据的推理；
+    - LATA：reward / sqrt(length)，防止模型靠写很长内容刷过程分；
+    - Group Advantage：对同组候选答案做均值/方差归一化，形成 GRPO 优势值。
 
     Parameters are deliberately simple and can be tuned by the trainer config.
     The default values favour valid, evidence-grounded tool use while penalising
@@ -111,6 +133,7 @@ class GRPORewardModel:
         min_length: int = 1,
         std_epsilon: float = 1e-8,
     ) -> None:
+        # 将外部传入的工具配置统一转换成 ToolSpec，方便后续校验。
         self.tool_specs = self._normalise_tool_specs(tool_specs or {})
         self.correct_tool_reward = correct_tool_reward
         self.invalid_tool_penalty = invalid_tool_penalty
@@ -145,15 +168,20 @@ class GRPORewardModel:
                 environment or evaluator. It is added to the process reward.
         """
 
+        # context 可以携带额外工具约束、已知事实、环境验证器等 rollout 状态。
         context = dict(context or {})
+        # 1) 将原始模型输出切分为 thought/action/observation/final 等步骤。
         steps = self.parse_thought_chain(output)
+        # 2) 对每个步骤单独打分，形成可解释的过程奖励。
         step_rewards = tuple(
             self._score_step(step, prompt=prompt, previous_steps=steps[:idx], context=context)
             for idx, step in enumerate(steps)
         )
         process_reward = sum(step.reward for step in step_rewards)
+        # 3) 总原始奖励 = 过程奖励 + 环境/评测器给出的终局奖励。
         raw_reward = process_reward + float(outcome_reward)
         length = self.measure_length(output)
+        # 4) 可选 LATA 长度归一化，降低过长输出获得不成比例高分的风险。
         final_reward = self.apply_lata(raw_reward, length) if self.length_normalization else raw_reward
         return RewardBreakdown(
             raw_reward=raw_reward,
@@ -181,6 +209,7 @@ class GRPORewardModel:
         if len(group_ids) != len(values):
             raise ValueError("group_ids must have the same length as rewards")
 
+        # 将同一个 prompt/group 的候选答案放在一起，分别做标准化。
         grouped: dict[Any, list[int]] = {}
         for idx, gid in enumerate(group_ids):
             grouped.setdefault(gid, []).append(idx)
@@ -191,6 +220,7 @@ class GRPORewardModel:
             mean = sum(group_values) / len(group_values)
             variance = sum((v - mean) ** 2 for v in group_values) / len(group_values)
             std = math.sqrt(variance)
+            # 如果同组 reward 完全一样，方差接近 0，则 advantage 保持 0，避免除零和无意义更新。
             if std <= self.std_epsilon:
                 continue
             for i in indices:
@@ -200,6 +230,7 @@ class GRPORewardModel:
     def parse_thought_chain(self, output: str) -> tuple[ThoughtStep, ...]:
         """Parse thought/action/observation/final steps from model output."""
 
+        # 按显式 Step/Thought/Action/Observation/Final 标记或空行切分文本。
         chunks = self._split_into_chunks(output)
         steps: list[ThoughtStep] = []
         for raw_chunk in chunks:
@@ -210,6 +241,7 @@ class GRPORewardModel:
             tool_name = None
             tool_args: Mapping[str, Any] = {}
             if kind == "tool_call":
+                # 对工具调用步骤进一步解析工具名和参数，后续用于合法性校验。
                 tool_name, tool_args = self._parse_tool_call(chunk)
             steps.append(
                 ThoughtStep(
@@ -231,6 +263,7 @@ class GRPORewardModel:
             if output is None:
                 raise ValueError("Either length or output must be provided")
             length = self.measure_length(output)
+        # 使用 min_length 防止极短输出导致除以 0 或 reward 被异常放大。
         effective_length = max(int(length), self.min_length)
         return float(raw_reward) / math.sqrt(effective_length)
 
@@ -250,10 +283,12 @@ class GRPORewardModel:
         reward = 0.0
         reasons: list[str] = []
 
+        # 重复步骤通常意味着模型陷入循环，给予惩罚。
         if self._is_repetitive(step, previous_steps):
             reward += self.repetition_penalty
             reasons.append("repetitive_step")
 
+        # 不同类型步骤采用不同奖励规则。
         if step.kind == "tool_call":
             ok, tool_reasons = self._validate_tool_call(step, context)
             if ok:
@@ -288,6 +323,7 @@ class GRPORewardModel:
         if not step.tool_name:
             return False, ["missing_tool_name"]
 
+        # 全局 tool_specs 可被当前 rollout context 中的 tool_specs 覆盖或扩展。
         tool_specs = dict(self.tool_specs)
         tool_specs.update(self._normalise_tool_specs(context.get("tool_specs", {})))
         spec = tool_specs.get(step.tool_name)
@@ -328,10 +364,12 @@ class GRPORewardModel:
         evidence_parts.extend(str(fact) for fact in context.get("known_facts", []) or [])
         evidence = "\n".join(evidence_parts).lower()
 
+        # 如果推理中引用了数字，要求这些数字能在 prompt/observation/known_facts 中找到。
         referenced_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", text))
         if referenced_numbers and not all(number in evidence for number in referenced_numbers):
             return False
 
+        # 用关键词重叠和 because/therefore 等因果词，近似判断推理是否有证据支撑。
         meaningful_tokens = {
             token
             for token in self._WORD_RE.findall(text)
@@ -385,6 +423,7 @@ class GRPORewardModel:
                 break
         payload = re.sub(r"^(?:Action|Tool)\s*[:：]\s*", "", payload.strip(), flags=re.I)
 
+        # 优先解析 JSON/Python 字面量形式的工具调用，如 {"tool": "search", "args": {...}}。
         parsed = self._parse_mapping(payload)
         if isinstance(parsed, Mapping):
             name = parsed.get("tool") or parsed.get("name") or parsed.get("api")
@@ -393,6 +432,7 @@ class GRPORewardModel:
                 name, args = next(iter(parsed.items()))
             return str(name) if name is not None else None, args if isinstance(args, Mapping) else {}
 
+        # 其次兼容函数调用形式，如 search(query="...")。
         call_match = re.match(r"([A-Za-z_]\w*)\s*\((.*)\)\s*$", payload, flags=re.S)
         if call_match:
             name = call_match.group(1)
